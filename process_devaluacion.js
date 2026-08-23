@@ -4,9 +4,6 @@
 const fs = require('fs');
 const path = require('path');
 
-const INPUT = process.argv[2] || path.join(__dirname, 'tipo_de_cambio.csv');
-const OUTPUT = process.argv[3] || path.join(__dirname, 'devaluacion_mensual.csv');
-
 const SEP = ';';
 const DECIMALS = 10;
 
@@ -36,13 +33,6 @@ function variacionPorcentual(a, b) {
   return `${q < 0n ? '-' : ''}${int}.${frac}`;
 }
 
-// Ultimo dia del mes en DD/MM/AAAA (contempla 28/29/30/31 y bisiestos).
-function lastDayOfMonth(monthKey) {
-  const [year, month] = monthKey.split('-').map(Number);
-  const day = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return `${String(day).padStart(2, '0')}/${String(month).padStart(2, '0')}/${year}`;
-}
-
 // Mes calendario inmediatamente anterior a YYYY-MM.
 function previousMonth(monthKey) {
   const [year, month] = monthKey.split('-').map(Number);
@@ -63,58 +53,73 @@ function isMonthClosed(monthKey, lastDay) {
   return true;
 }
 
-const raw = fs.readFileSync(INPUT, 'utf8').replace(/^﻿/, '');
-const lines = raw.split(/\r?\n/).filter((line) => line.trim() !== '');
+// Lee una serie diaria en el formato de tipo_de_cambio.csv (DD/MM/AAAA;cotizacion) y escribe
+// su variacion mensual en YYYY-MM;porcentaje. Sirve para cualquier serie con ese contrato:
+// hoy la usan el dolar oficial y el blue (ver process_devaluacion_blue.js).
+function procesar(INPUT, OUTPUT) {
+  const raw = fs.readFileSync(INPUT, 'utf8').replace(/^﻿/, '');
+  const lines = raw.split(/\r?\n/).filter((line) => line.trim() !== '');
 
-if (lines.length === 0) {
-  console.error(`El archivo ${INPUT} esta vacio.`);
-  process.exit(1);
+  if (lines.length === 0) {
+    console.error(`El archivo ${INPUT} esta vacio.`);
+    process.exit(1);
+  }
+
+  // Ultima cotizacion de cada mes: se recorre en orden y cada fecha posterior pisa a la
+  // anterior, asi el cierre no depende de que el archivo llegue al ultimo dia calendario.
+  const closes = new Map(); // YYYY-MM -> { day, value }
+
+  for (const line of lines) {
+    const [dateStr, valueStr] = line.split(SEP);
+    const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec((dateStr || '').trim());
+    if (!m) {
+      console.warn(`Fecha no reconocida, se ignora: ${JSON.stringify(line)}`);
+      continue;
+    }
+
+    const value = toScaled(valueStr || '');
+    if (value === null || value === 0n) {
+      console.warn(`Cotizacion no valida en ${dateStr}, se ignora.`);
+      continue;
+    }
+
+    const key = `${m[3]}-${m[2]}`;
+    const day = Number(m[1]);
+    const prev = closes.get(key);
+    if (!prev || day >= prev.day) closes.set(key, { day, value });
+  }
+
+  const months = [...closes.keys()].sort();
+  const lastMonth = months[months.length - 1];
+  const out = [];
+  const skipped = [];
+
+  for (const month of months) {
+    if (month === lastMonth && !isMonthClosed(month, closes.get(month).day)) {
+      skipped.push(`${month} (mes sin cerrar, ultimo dato ${closes.get(month).day})`);
+      continue;
+    }
+
+    const prevKey = previousMonth(month);
+    if (!closes.has(prevKey)) {
+      skipped.push(`${month} (falta el cierre de ${prevKey})`);
+      continue;
+    }
+
+    // La clave del mes ya viene en YYYY-MM: es tal cual la primera columna de la salida.
+    out.push(`${month}${SEP}${variacionPorcentual(closes.get(month).value, closes.get(prevKey).value)}`);
+  }
+
+  fs.writeFileSync(OUTPUT, out.join('\n') + '\n', 'utf8');
+  console.log(`OK: ${out.length} filas escritas en ${OUTPUT}`);
+  for (const s of skipped) console.log(`  omitido: ${s}`);
 }
 
-// Ultima cotizacion de cada mes: se recorre en orden y cada fecha posterior pisa a la
-// anterior, asi el cierre no depende de que el archivo llegue al ultimo dia calendario.
-const closes = new Map(); // YYYY-MM -> { day, value }
+module.exports = { procesar };
 
-for (const line of lines) {
-  const [dateStr, valueStr] = line.split(SEP);
-  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec((dateStr || '').trim());
-  if (!m) {
-    console.warn(`Fecha no reconocida, se ignora: ${JSON.stringify(line)}`);
-    continue;
-  }
-
-  const value = toScaled(valueStr || '');
-  if (value === null || value === 0n) {
-    console.warn(`Cotizacion no valida en ${dateStr}, se ignora.`);
-    continue;
-  }
-
-  const key = `${m[3]}-${m[2]}`;
-  const day = Number(m[1]);
-  const prev = closes.get(key);
-  if (!prev || day >= prev.day) closes.set(key, { day, value });
+if (require.main === module) {
+  procesar(
+    process.argv[2] || path.join(__dirname, 'tipo_de_cambio.csv'),
+    process.argv[3] || path.join(__dirname, 'devaluacion_mensual.csv'),
+  );
 }
-
-const months = [...closes.keys()].sort();
-const lastMonth = months[months.length - 1];
-const out = [];
-const skipped = [];
-
-for (const month of months) {
-  if (month === lastMonth && !isMonthClosed(month, closes.get(month).day)) {
-    skipped.push(`${month} (mes sin cerrar, ultimo dato ${closes.get(month).day})`);
-    continue;
-  }
-
-  const prevKey = previousMonth(month);
-  if (!closes.has(prevKey)) {
-    skipped.push(`${month} (falta el cierre de ${prevKey})`);
-    continue;
-  }
-
-  out.push(`${lastDayOfMonth(month)}${SEP}${variacionPorcentual(closes.get(month).value, closes.get(prevKey).value)}`);
-}
-
-fs.writeFileSync(OUTPUT, out.join('\n') + '\n', 'utf8');
-console.log(`OK: ${out.length} filas escritas en ${OUTPUT}`);
-for (const s of skipped) console.log(`  omitido: ${s}`);
